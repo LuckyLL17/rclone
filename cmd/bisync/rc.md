@@ -5,6 +5,11 @@ This takes the following parameters:
 - path1 (required) - (string) a remote directory string e.g. `drive:path1`
 - path2 (required) - (string) a remote directory string e.g. `drive:path2`
 - dryRun - (bool) dry-run mode
+- apply - (string) Validate and execute the plan file created by a previous --
+plan run. The working directory, filters, configuration and both paths'
+listing fingerprints must still match, and the plan is atomically consumed
+before any change is made. If any validation check fails, no operations at
+all are executed.  
 - backupDir1 - (string) --backup-dir for Path1. Must be a non-overlapping path on
 the same remote.  
 - backupDir2 - (string) --backup-dir for Path2. Must be a non-overlapping path on
@@ -40,6 +45,11 @@ checksum to additionally skip post-copy checksum checks)
 testing).  
 - noSlowHash - (bool) Ignore listing checksums only on backends where they are
 slow  
+- plan - (string) Write a plan of all pending changes (copies, deletes,
+renames and conflict decisions) to this file after listing and conflict
+resolution, without changing either path or the bisync state. The plan
+records fingerprints of both paths' listings plus the filters and
+configuration in effect. Use --apply in a later run to execute it.  
 - recover - (bool) Automatically recover from interruptions without requiring --
 resync.  
 - removeEmptyDirs - (bool) Remove ALL empty directories at the final cleanup

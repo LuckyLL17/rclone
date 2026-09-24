@@ -284,22 +284,58 @@ func (b *bisyncRun) findDeltas(fctx context.Context, f fs.Fs, oldListing string,
 }
 
 // applyDeltas
-func (b *bisyncRun) applyDeltas(ctx context.Context, ds1, ds2 *deltaSet) (results2to1, results1to2 []Results, queues queues, err error) {
+func (b *bisyncRun) applyDeltas(ctx context.Context, ds1, ds2 *deltaSet) (results2to1, results1to2 []Results, q queues, err error) {
+	var dirs1, dirs2 *fileList
+	b.planCapture = b.opt.Plan != ""
+	q, dirs1, dirs2, err = b.decideDeltas(ctx, ds1, ds2)
+	if err != nil {
+		return
+	}
+
+	// Plan runs only record the decisions: nothing is copied, deleted or
+	// renamed here (the dry-run context already skips destructive calls).
+	if b.opt.Plan != "" {
+		if err = b.savePlan(ctx, q, true); err != nil {
+			b.critical = true
+			b.retryable = true
+			return
+		}
+	}
+
+	results2to1, results1to2, err = b.executeQueues(ctx, q, dirs1, dirs2)
+	return
+}
+
+// decideDeltas performs the read-only listing and conflict analysis and
+// returns the queues that would bring the two paths into sync, together
+// with the directory-only listings. Conflict renames and loser deletes are
+// performed through ctxMove (which is dry-run during planning), while copy
+// queues are returned for the caller to execute.
+func (b *bisyncRun) decideDeltas(ctx context.Context, ds1, ds2 *deltaSet) (q queues, dirs1, dirs2 *fileList, err error) {
 	path1 := bilib.FsPath(b.fs1)
 	path2 := bilib.FsPath(b.fs2)
 
-	copy1to2 := bilib.Names{}
-	copy2to1 := bilib.Names{}
-	delete1 := bilib.Names{}
-	delete2 := bilib.Names{}
+	q.copy1to2 = bilib.Names{}
+	q.copy2to1 = bilib.Names{}
+	q.delete1 = bilib.Names{}
+	q.delete2 = bilib.Names{}
 	handled := bilib.Names{}
-	renameSkipped := bilib.Names{}
-	deletedonboth := bilib.Names{}
-	skippedDirs1 := newFileList()
-	skippedDirs2 := newFileList()
+	q.renameSkipped = bilib.Names{}
+	q.deletedonboth = bilib.Names{}
+	q.skippedDirs1 = newFileList()
+	q.skippedDirs2 = newFileList()
 	b.renames = renames{}
 
 	ctxMove := b.opt.setDryRun(ctx)
+
+	copy1to2 := q.copy1to2
+	copy2to1 := q.copy2to1
+	delete1 := q.delete1
+	delete2 := q.delete2
+	renameSkipped := q.renameSkipped
+	deletedonboth := q.deletedonboth
+	skippedDirs1 := q.skippedDirs1
+	skippedDirs2 := q.skippedDirs2
 
 	// update AliasMap for deleted files, as march does not know about them
 	b.updateAliases(ctx, ds1, ds2)
@@ -482,61 +518,61 @@ func (b *bisyncRun) applyDeltas(ctx context.Context, ds1, ds2 *deltaSet) (result
 		}
 	}
 
-	// Do the batch operation
-	if copy2to1.NotEmpty() && !b.InGracefulShutdown {
+	return q, dirs1, dirs2, nil
+}
+
+// executeQueues performs the queued copies and propagates empty directory
+// creation/removal. Deletions ride along with the copy queues (the
+// --files-from sync semantics delete missing source files), except for
+// empty directory removals which use the delete queues.
+func (b *bisyncRun) executeQueues(ctx context.Context, q queues, dirs1, dirs2 *fileList) (results2to1, results1to2 []Results, err error) {
+	if q.copy2to1.NotEmpty() && !b.InGracefulShutdown {
 		b.indent("Path2", "Path1", "Do queued copies to")
 		ctx = b.setBackupDir(ctx, 1)
-		results2to1, err = b.fastCopy(ctx, b.fs2, b.fs1, copy2to1, "copy2to1")
+		results2to1, err = b.fastCopy(ctx, b.fs2, b.fs1, q.copy2to1, "copy2to1")
 
 		// retries, if any
-		results2to1, err = b.retryFastCopy(ctx, b.fs2, b.fs1, copy2to1, "copy2to1", results2to1, err)
+		results2to1, err = b.retryFastCopy(ctx, b.fs2, b.fs1, q.copy2to1, "copy2to1", results2to1, err)
 
 		if !b.InGracefulShutdown && err != nil {
 			return
 		}
 
 		// copy empty dirs from path2 to path1 (if --create-empty-src-dirs)
-		b.syncEmptyDirs(ctx, b.fs1, copy2to1, dirs2, &results2to1, "make")
+		b.syncEmptyDirs(ctx, b.fs1, q.copy2to1, dirs2, &results2to1, "make")
 	}
 
-	if copy1to2.NotEmpty() && !b.InGracefulShutdown {
+	if q.copy1to2.NotEmpty() && !b.InGracefulShutdown {
 		b.indent("Path1", "Path2", "Do queued copies to")
 		ctx = b.setBackupDir(ctx, 2)
-		results1to2, err = b.fastCopy(ctx, b.fs1, b.fs2, copy1to2, "copy1to2")
+		results1to2, err = b.fastCopy(ctx, b.fs1, b.fs2, q.copy1to2, "copy1to2")
 
 		// retries, if any
-		results1to2, err = b.retryFastCopy(ctx, b.fs1, b.fs2, copy1to2, "copy1to2", results1to2, err)
+		results1to2, err = b.retryFastCopy(ctx, b.fs1, b.fs2, q.copy1to2, "copy1to2", results1to2, err)
 
 		if !b.InGracefulShutdown && err != nil {
 			return
 		}
 
 		// copy empty dirs from path1 to path2 (if --create-empty-src-dirs)
-		b.syncEmptyDirs(ctx, b.fs2, copy1to2, dirs1, &results1to2, "make")
+		b.syncEmptyDirs(ctx, b.fs2, q.copy1to2, dirs1, &results1to2, "make")
 	}
 
-	if delete1.NotEmpty() && !b.InGracefulShutdown {
-		if err = b.saveQueue(delete1, "delete1"); err != nil {
+	if q.delete1.NotEmpty() && !b.InGracefulShutdown {
+		if err = b.saveQueue(q.delete1, "delete1"); err != nil {
 			return
 		}
 		// propagate deletions of empty dirs from path2 to path1 (if --create-empty-src-dirs)
-		b.syncEmptyDirs(ctx, b.fs1, delete1, dirs1, &results2to1, "remove")
+		b.syncEmptyDirs(ctx, b.fs1, q.delete1, dirs1, &results2to1, "remove")
 	}
 
-	if delete2.NotEmpty() && !b.InGracefulShutdown {
-		if err = b.saveQueue(delete2, "delete2"); err != nil {
+	if q.delete2.NotEmpty() && !b.InGracefulShutdown {
+		if err = b.saveQueue(q.delete2, "delete2"); err != nil {
 			return
 		}
 		// propagate deletions of empty dirs from path1 to path2 (if --create-empty-src-dirs)
-		b.syncEmptyDirs(ctx, b.fs2, delete2, dirs2, &results1to2, "remove")
+		b.syncEmptyDirs(ctx, b.fs2, q.delete2, dirs2, &results1to2, "remove")
 	}
-
-	queues.copy1to2 = copy1to2
-	queues.copy2to1 = copy2to1
-	queues.renameSkipped = renameSkipped
-	queues.deletedonboth = deletedonboth
-	queues.skippedDirs1 = skippedDirs1
-	queues.skippedDirs2 = skippedDirs2
 
 	return
 }

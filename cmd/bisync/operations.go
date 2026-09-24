@@ -56,11 +56,18 @@ type bisyncRun struct {
 	queueOpt           bisyncQueueOpt
 	downloadHashOpt    downloadHashOpt
 	lockFileOpt        lockFileOpt
+	applyPlan          *planFile
+	// planCapture is true while decisions are captured for a plan (--plan
+	// run or the --apply cross-check), so dry-run skips are not mistaken
+	// for equality skips.
+	planCapture bool
 }
 
 type queues struct {
 	copy1to2      bilib.Names
 	copy2to1      bilib.Names
+	delete1       bilib.Names
+	delete2       bilib.Names
 	renameSkipped bilib.Names // not renamed because it was equal
 	skippedDirs1  *fileList
 	skippedDirs2  *fileList
@@ -85,6 +92,22 @@ func Bisync(ctx context.Context, fs1, fs2 fs.Fs, optArg *Options) (err error) {
 	}
 	ci := fs.GetConfig(ctx)
 	opt.OrigBackupDir = ci.BackupDir
+
+	if opt.Plan != "" && opt.Apply != "" {
+		return errors.New("--plan and --apply are mutually exclusive")
+	}
+	if opt.Apply != "" && (ci.DryRun || opt.DryRun) {
+		return errors.New("--apply cannot be combined with --dry-run: the approved plan must be executed")
+	}
+	if (opt.Plan != "" || opt.Apply != "") && opt.CheckSync == CheckSyncOnly {
+		return errors.New("--plan and --apply are not compatible with --check-sync only")
+	}
+	// Plan runs are strictly read-only: force the dry-run option on our
+	// local copy so no listings, lock files or remote files are touched
+	// (without mutating the caller's context, which the RC reuses).
+	if opt.Plan != "" {
+		opt.DryRun = true
+	}
 
 	if ci.TerminalColorMode == fs.TerminalColorModeAlways || (ci.TerminalColorMode == fs.TerminalColorModeAuto && !log.Redirected()) {
 		ColorsLock.Lock()
@@ -271,40 +294,20 @@ func (b *bisyncRun) runLocked(octx context.Context) (err error) {
 		return err
 	}
 
+	// --apply validates an approved plan and executes it, for both normal
+	// and --resync runs
+	if opt.Apply != "" {
+		return b.applyRun(octx, fctx)
+	}
+
 	// Generate Path1 and Path2 listings and copy any unique Path2 files to Path1
 	if opt.Resync {
 		return b.resync(fctx)
 	}
 
 	// Check for existence of prior Path1 and Path2 listings
-	if !bilib.FileExists(b.listing1) || !bilib.FileExists(b.listing2) {
-		if b.opt.Recover && bilib.FileExists(b.listing1+"-old") && bilib.FileExists(b.listing2+"-old") {
-			errTip := fmt.Sprintf(Color(terminal.CyanFg, "Path1: %s\n"), Color(terminal.HiBlueFg, b.listing1))
-			errTip += fmt.Sprintf(Color(terminal.CyanFg, "Path2: %s"), Color(terminal.HiBlueFg, b.listing2))
-			fs.Log(nil, Color(terminal.YellowFg, "Listings not found. Reverting to prior backup as --recover is set. \n")+errTip)
-			if opt.CheckSync != CheckSyncFalse {
-				// Run CheckSync to ensure old listing is valid (garbage in, garbage out!)
-				fs.Infof(nil, "Validating backup listings for Path1 %s vs Path2 %s", quotePath(path1), quotePath(path2))
-				if err = b.checkSync(b.listing1+"-old", b.listing2+"-old"); err != nil {
-					b.critical = true
-					b.retryable = true
-					return err
-				}
-				fs.Infoc(nil, Color(terminal.GreenFg, "Backup listing is valid."))
-			}
-			b.revertToOldListings()
-		} else {
-			// On prior critical error abort, the prior listings are renamed to .lst-err to lock out further runs
-			b.critical = true
-			b.retryable = true
-			errTip := Color(terminal.MagentaFg, "Tip: here are the filenames we were looking for. Do they exist? \n")
-			errTip += fmt.Sprintf(Color(terminal.CyanFg, "Path1: %s\n"), Color(terminal.HiBlueFg, b.listing1))
-			errTip += fmt.Sprintf(Color(terminal.CyanFg, "Path2: %s\n"), Color(terminal.HiBlueFg, b.listing2))
-			errTip += Color(terminal.MagentaFg, "Try running this command to inspect the work dir: \n")
-			errTip += fmt.Sprintf(Color(terminal.HiCyanFg, "rclone lsl \"%s\""), b.workDir)
-
-			return errors.New("cannot find prior Path1 or Path2 listings, likely due to critical error on prior run \n" + errTip)
-		}
+	if err = b.ensurePriorListings(path1, path2); err != nil {
+		return err
 	}
 
 	fs.Infof(nil, "Building Path1 and Path2 listings")
@@ -377,6 +380,13 @@ func (b *bisyncRun) runLocked(octx context.Context) (err error) {
 
 	if noChanges {
 		fs.Infof(nil, "No changes found")
+		if opt.Plan != "" {
+			if err = b.savePlan(octx, queues, false); err != nil {
+				b.critical = true
+				b.retryable = true
+				return err
+			}
+		}
 	} else {
 		fs.Infof(nil, "Applying changes")
 		results2to1, results1to2, queues, err = b.applyDeltas(octx, ds1, ds2)
@@ -424,6 +434,17 @@ func (b *bisyncRun) runLocked(octx context.Context) (err error) {
 		b.retryable = true
 		return err
 	}
+
+	return b.postSyncChecks(fctx)
+}
+
+// postSyncChecks removes the new listings, validates the final listings
+// against each other and optionally removes empty directories.
+// It is shared by normal runs and --apply runs.
+func (b *bisyncRun) postSyncChecks(fctx context.Context) (err error) {
+	opt := b.opt
+	path1 := bilib.FsPath(b.fs1)
+	path2 := bilib.FsPath(b.fs2)
 
 	if !opt.NoCleanup {
 		_ = os.Remove(b.newListing1)
@@ -595,6 +616,42 @@ func (b *bisyncRun) overlappingPathsCheck(fctx context.Context, fs1, fs2 fs.Fs) 
 		return err
 	}
 	return nil
+}
+
+// ensurePriorListings makes sure both prior listings exist, reverting to the
+// -old backups when --recover is set. Without --recover, missing listings are
+// a critical error.
+func (b *bisyncRun) ensurePriorListings(path1, path2 string) (err error) {
+	opt := b.opt
+	if bilib.FileExists(b.listing1) && bilib.FileExists(b.listing2) {
+		return nil
+	}
+	if opt.Recover && bilib.FileExists(b.listing1+"-old") && bilib.FileExists(b.listing2+"-old") {
+		errTip := fmt.Sprintf(Color(terminal.CyanFg, "Path1: %s\n"), Color(terminal.HiBlueFg, b.listing1))
+		errTip += fmt.Sprintf(Color(terminal.CyanFg, "Path2: %s"), Color(terminal.HiBlueFg, b.listing2))
+		fs.Log(nil, Color(terminal.YellowFg, "Listings not found. Reverting to prior backup as --recover is set. \n")+errTip)
+		if opt.CheckSync != CheckSyncFalse {
+			// Run CheckSync to ensure old listing is valid (garbage in, garbage out!)
+			fs.Infof(nil, "Validating backup listings for Path1 %s vs Path2 %s", quotePath(path1), quotePath(path2))
+			if err = b.checkSync(b.listing1+"-old", b.listing2+"-old"); err != nil {
+				b.critical = true
+				b.retryable = true
+				return err
+			}
+			fs.Infoc(nil, Color(terminal.GreenFg, "Backup listing is valid."))
+		}
+		b.revertToOldListings()
+		return nil
+	}
+	// On prior critical error abort, the prior listings are renamed to .lst-err to lock out further runs
+	b.critical = true
+	b.retryable = true
+	errTip := Color(terminal.MagentaFg, "Tip: here are the filenames we were looking for. Do they exist? \n")
+	errTip += fmt.Sprintf(Color(terminal.CyanFg, "Path1: %s\n"), Color(terminal.HiBlueFg, b.listing1))
+	errTip += fmt.Sprintf(Color(terminal.CyanFg, "Path2: %s\n"), Color(terminal.HiBlueFg, b.listing2))
+	errTip += Color(terminal.MagentaFg, "Try running this command to inspect the work dir: \n")
+	errTip += fmt.Sprintf(Color(terminal.HiCyanFg, "rclone lsl \"%s\""), b.workDir)
+	return errors.New("cannot find prior Path1 or Path2 listings, likely due to critical error on prior run \n" + errTip)
 }
 
 func (b *bisyncRun) checkSyntax() (err error) {

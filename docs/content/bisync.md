@@ -96,6 +96,7 @@ Positional arguments:
                 Type 'rclone listremotes' for list of configured remotes.
 
 Optional Flags:
+      --apply string                         Validate and execute the plan file created by a previous --plan run.
       --backup-dir1 string                   --backup-dir for Path1. Must be a non-overlapping path on the same remote.
       --backup-dir2 string                   --backup-dir for Path2. Must be a non-overlapping path on the same remote.
       --check-access                         Ensure expected RCLONE_TEST files are found on both Path1 and Path2 filesystems, else abort.
@@ -114,6 +115,7 @@ Optional Flags:
       --max-lock Duration                    Consider lock files older than this to be expired (default: 0 (never expire)) (minimum: 2m) (default 0s)
       --no-cleanup                           Retain working files (useful for troubleshooting and testing).
       --no-slow-hash                         Ignore listing checksums only on backends where they are slow
+      --plan string                          Write a plan of all pending changes to this file without changing either path, then exit.
       --recover                              Automatically recover from interruptions without requiring --resync.
       --remove-empty-dirs                    Remove ALL empty directories at the final cleanup step.
       --resilient                            Allow future runs to retry after certain less-serious errors, instead of requiring --resync.
@@ -876,6 +878,64 @@ See also: [`--suffix`](/docs/#suffix-string),
 [`--suffix-keep-extension`](/docs/#suffix-keep-extension)
 
 ## Operation
+
+### --plan and --apply {#plan-apply}
+
+For workflows where changes must be approved (or inspected) before they are
+executed, bisync can split a run into a read-only planning phase and an
+execution phase.
+
+With `--plan FILE`, bisync performs the listing and conflict resolution
+exactly as usual but does not copy, delete, rename or modify any file,
+listing or lock file (like a more complete `--dry-run`). Instead it writes
+FILE, a self-contained plan recording, in a stable order:
+
+- fingerprints of both paths' current listings and of the previous listings,
+- the decision-relevant configuration (compare settings, conflict settings,
+  suffixes, backup dirs, etc.),
+- the filters file in use and its md5 hash, if any,
+- the paths, session and working directory the plan belongs to,
+- every queued copy, deletion and empty directory change,
+- every conflict decision (renames and loser deletes), including the exact
+  new names.
+
+The plan can then be reviewed, archived or approved out of band.
+
+With `--apply FILE`, bisync executes an existing plan, but only after
+re-validating everything that could make the recorded decisions unsafe:
+
+1. the paths, session and working directory must match the plan,
+2. the configuration and filters (including the filters file md5) must match,
+3. both paths are re-listed and their fingerprints must be identical to
+   those recorded when the plan was made,
+4. for a normal run, the previous listings must match as well, and the
+   freshly recomputed decisions must be identical to the approved queues.
+
+If any of these checks fails, bisync aborts **before performing any
+operation at all** and leaves the plan file in place for inspection. Only
+after every check passes is the plan atomically consumed (renamed to
+`FILE.applied-TIMESTAMP`, so it cannot be applied twice) and the approved
+queues executed with bisync's normal queue machinery. The final listings
+are updated and validated exactly as in a regular run.
+
+Typical use:
+
+```
+rclone bisync remote1:path1 remote2:path2 --plan /tmp/bisync-plan.json
+# review /tmp/bisync-plan.json
+rclone bisync remote1:path1 remote2:path2 --apply /tmp/bisync-plan.json
+```
+
+Notes:
+
+- `--plan` and `--apply` are mutually exclusive, and `--apply` cannot be
+  combined with `--dry-run`.
+- Both work with normal sync runs and with `--resync`, `--recover` and
+  `--filters-file`.
+- The equivalent [RC](/rc/) parameters are `plan` and `apply` for
+  [`sync/bisync`](/rc/#sync-bisync).
+- `--dry-run` keeps its old behavior (decisions are only logged); `--plan`
+  additionally saves the complete, reusable decision document.
 
 ### Runtime flow details
 

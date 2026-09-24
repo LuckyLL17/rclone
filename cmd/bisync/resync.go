@@ -7,6 +7,7 @@ import (
 
 	"github.com/rclone/rclone/cmd/bisync/bilib"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/lib/terminal"
 )
@@ -42,6 +43,17 @@ func (b *bisyncRun) setResyncDefaults() {
 // and resolve any differing files according to the --resync-mode.
 func (b *bisyncRun) resync(fctx context.Context) (err error) {
 	fs.Infof(nil, "Copying Path2 files to Path1")
+
+	// In plan mode, capture fingerprints of the current listings first so
+	// --apply can prove that neither path changed in the meantime.
+	if b.opt.Plan != "" {
+		if _, _, merr := b.makeMarchListing(fctx); merr != nil || accounting.Stats(fctx).Errored() {
+			fs.Error(nil, Color(terminal.RedFg, "There were errors while building listings. Aborting as it is too dangerous to continue."))
+			b.critical = true
+			b.retryable = true
+			return merr
+		}
+	}
 
 	// Save blank filelists (will be filled from sync results)
 	ls1 := newFileList()
@@ -127,35 +139,42 @@ func (b *bisyncRun) resync(fctx context.Context) (err error) {
 		return err
 	}
 
+	// When applying an approved resync plan, the fingerprints were proven
+	// identical so the copies must match the approved queues. Refuse the
+	// listing commit if they do not.
+	if b.applyPlan != nil {
+		if err = b.validateResyncResults(b.applyPlan, results2to1, results1to2); err != nil {
+			b.critical = true
+			return err
+		}
+	}
+
 	fs.Infof(nil, "Resync updating listings")
 	b.saveOldListings() // may not exist, as this is --resync
 	b.replaceCurrentListings()
 
-	resultsToQueue := func(results []Results) bilib.Names {
-		names := bilib.Names{}
-		for _, result := range results {
-			if result.Name != "" &&
-				(result.Flags != "d" || b.opt.CreateEmptySrcDirs) &&
-				result.IsSrc && result.Src != "" &&
-				(result.Winner.Err == nil || result.Flags == "d") {
-				names.Add(result.Name)
-			}
-		}
-		return names
-	}
-
 	// resync 2to1
-	queues.copy2to1 = resultsToQueue(results2to1)
+	queues.copy2to1 = b.resyncResultsNames(results2to1)
 	if err = b.modifyListing(fctx, b.fs2, b.fs1, results2to1, queues, false); err != nil {
 		b.critical = true
 		return err
 	}
 
 	// resync 1to2
-	queues.copy1to2 = resultsToQueue(results1to2)
+	queues.copy1to2 = b.resyncResultsNames(results1to2)
 	if err = b.modifyListing(fctx, b.fs1, b.fs2, results1to2, queues, true); err != nil {
 		b.critical = true
 		return err
+	}
+
+	// Plan runs only record the decisions; the dry-run copies above changed
+	// nothing.
+	if b.opt.Plan != "" {
+		if err = b.savePlan(fctx, queues, true); err != nil {
+			b.critical = true
+			b.retryable = true
+			return err
+		}
 	}
 
 	if b.opt.CheckSync == CheckSyncTrue && !b.opt.DryRun {

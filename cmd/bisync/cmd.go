@@ -51,6 +51,8 @@ type Options struct {
 	IgnoreListingChecksum bool
 	Resilient             bool
 	Recover               bool
+	Plan                  string   // write a plan file without making any changes
+	Apply                 string   // validate and apply an existing plan file
 	TestFn                TestFunc // test-only option, for mocking errors
 	Compare               CompareOpt
 	CompareFlag           string
@@ -61,6 +63,7 @@ type Options struct {
 	ConflictSuffixFlag    string
 	ConflictSuffix1       string
 	ConflictSuffix2       string
+	filtersFileHash       string // md5 of the filters file in use, populated by applyFilters
 }
 
 // Default values
@@ -151,6 +154,8 @@ func init() {
 	flags.FVarP(cmdFlags, &Opt.ConflictResolve, "conflict-resolve", "", "Automatically resolve conflicts by preferring the version that is: "+ConflictResolveList+" (default: none)", "")
 	flags.FVarP(cmdFlags, &Opt.ConflictLoser, "conflict-loser", "", "Action to take on the loser of a sync conflict (when there is a winner) or on both files (when there is no winner): "+ConflictLoserList+" (default: num)", "")
 	flags.StringVarP(cmdFlags, &Opt.ConflictSuffixFlag, "conflict-suffix", "", Opt.ConflictSuffixFlag, "Suffix to use when renaming a --conflict-loser. Can be either one string or two comma-separated strings to assign different suffixes to Path1/Path2. (default: 'conflict')", "")
+	flags.StringVarP(cmdFlags, &Opt.Plan, "plan", "", Opt.Plan, MakeHelp("Write a plan of all pending changes (copies, deletes, renames and conflict decisions) to this file after listing and conflict resolution, without changing either path or the bisync state. The plan records fingerprints of both paths' listings plus the filters and configuration in effect. Use --apply in a later run to execute it."), "")
+	flags.StringVarP(cmdFlags, &Opt.Apply, "apply", "", Opt.Apply, MakeHelp("Validate and execute the plan file created by a previous --plan run. The working directory, filters, configuration and both paths' listing fingerprints must still match, and the plan is atomically consumed before any change is made. If any validation check fails, no operations at all are executed."), "")
 	_ = cmdFlags.MarkHidden("debugname")
 	_ = cmdFlags.MarkHidden("localtime")
 	addRC()
@@ -245,6 +250,7 @@ func (opt *Options) applyFilters(ctx context.Context) (context.Context, error) {
 	}
 	gotHash := hex.EncodeToString(hasher.Sum(nil))
 	_ = f.Close()
+	opt.filtersFileHash = gotHash
 
 	hashFile := filtersFile + ".md5"
 	wantHash, err := os.ReadFile(hashFile)

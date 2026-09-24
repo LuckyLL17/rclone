@@ -162,6 +162,12 @@ func rcBisync(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 		opt.MaxLock = 0
 		fs.Debugf("maxLock", "optional parameter is missing. using default value: %v", opt.MaxLock)
 	}
+	if opt.Plan, err = in.GetString("plan"); rc.NotErrParamNotFound(err) {
+		fs.Debugf("plan", "optional parameter is missing. using default value: %v", opt.Plan)
+	}
+	if opt.Apply, err = in.GetString("apply"); rc.NotErrParamNotFound(err) {
+		fs.Debugf("apply", "optional parameter is missing. using default value: %v", opt.Apply)
+	}
 
 	fs1, err := rc.GetFsNamed(octx, in, "path1")
 	if err != nil {
@@ -184,7 +190,7 @@ func rcBisync(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	basePath := bilib.BasePath(ctx, workDir, fs1, fs2)
 
 	_, _ = log.Writer().Write(output)
-	return rc.Params{
+	out = rc.Params{
 		"output":   string(output),
 		"session":  bilib.SessionName(fs1, fs2),
 		"workDir":  workDir,
@@ -192,7 +198,14 @@ func rcBisync(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 		"listing1": basePath + ".path1.lst",
 		"listing2": basePath + ".path2.lst",
 		"logFile":  fslog.Opt.File,
-	}, err
+	}
+	if opt.Plan != "" {
+		out["plan"] = opt.Plan
+	}
+	if opt.Apply != "" {
+		out["apply"] = opt.Apply
+	}
+	return out, err
 }
 
 func setEnum(in rc.Params, name string, defaultVal string, set func(s string) error) error {

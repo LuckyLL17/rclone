@@ -316,14 +316,16 @@ func (b *bisyncRun) rename(ctx context.Context, thisNamePair namePair, thisPath,
 		skip := operations.SkipDestructive(ctx, thisNamePair.oldName, "rename")
 		if !skip {
 			b.indent(fmt.Sprintf("!Path%d", thisPathNum), thisPath+thisNamePair.newName, fmt.Sprintf("Renaming Path%d copy", thisPathNum))
-			ctx = b.setBackupDir(ctx, thisPathNum) // in case already a file with new name
-			if err = operations.MoveFile(ctx, thisFs, thisFs, thisNamePair.newName, thisNamePair.oldName); err != nil {
-				err = fmt.Errorf("%s rename failed for %s: %w", thisPath, thisPath+thisNamePair.oldName, err)
-				b.critical = true
+			if err = b.moveConflictFile(ctx, thisPathNum, thisNamePair.oldName, thisNamePair.newName); err != nil {
 				return err
 			}
 		} else {
-			renameSkipped.Add(thisNamePair.oldName) // (due to dry-run, not equality)
+			// While capturing decisions for a plan, the rename is recorded
+			// in b.renames for later --apply and must not look like an
+			// equality skip.
+			if !b.planCapture {
+				renameSkipped.Add(thisNamePair.oldName) // (due to dry-run, not equality)
+			}
 		}
 	}
 	b.indent(fmt.Sprintf("!Path%d", thisPathNum), thatPath+thisNamePair.newName, fmt.Sprintf("Queue copy to Path%d", thatPathNum))
@@ -331,32 +333,63 @@ func (b *bisyncRun) rename(ctx context.Context, thisNamePair namePair, thisPath,
 	return nil
 }
 
+// pathNumFs returns the Fs and display path for side 1 or 2
+func (b *bisyncRun) pathNumFs(pathNum int) (f fs.Fs, p string) {
+	if pathNum == 2 {
+		return b.fs2, bilib.FsPath(b.fs2)
+	}
+	return b.fs1, bilib.FsPath(b.fs1)
+}
+
+// moveConflictFile renames oldName to newName on one path, honouring that
+// path's --backup-dir. It is used by conflict resolution and replayed by
+// --apply.
+func (b *bisyncRun) moveConflictFile(ctx context.Context, pathNum int, oldName, newName string) error {
+	f, p := b.pathNumFs(pathNum)
+	ctx = b.setBackupDir(ctx, pathNum) // in case already a file with new name
+	if err := operations.MoveFile(ctx, f, f, newName, oldName); err != nil {
+		err = fmt.Errorf("%s rename failed for %s: %w", p, p+oldName, err)
+		b.critical = true
+		return err
+	}
+	return nil
+}
+
 func (b *bisyncRun) delete(ctx context.Context, thisNamePair namePair, thisPath string, thisFs fs.Fs, thisPathNum int, renameSkipped *bilib.Names) (err error) {
 	skip := operations.SkipDestructive(ctx, thisNamePair.oldName, "delete")
 	if !skip {
 		b.indent(fmt.Sprintf("!Path%d", thisPathNum), thisPath+thisNamePair.oldName, fmt.Sprintf("Deleting Path%d copy", thisPathNum))
-		ctx = b.setBackupDir(ctx, thisPathNum)
-		ci := fs.GetConfig(ctx)
-		var backupDir fs.Fs
-		if ci.BackupDir != "" {
-			backupDir, err = operations.BackupDir(ctx, thisFs, thisFs, thisNamePair.oldName)
-			if err != nil {
-				b.critical = true
-				return err
-			}
-		}
-		obj, err := thisFs.NewObject(ctx, thisNamePair.oldName)
-		if err != nil {
-			b.critical = true
-			return err
-		}
-		if err = operations.DeleteFileWithBackupDir(ctx, obj, backupDir); err != nil {
-			err = fmt.Errorf("%s delete failed for %s: %w", thisPath, thisPath+thisNamePair.oldName, err)
-			b.critical = true
-			return err
-		}
-	} else {
+		return b.deleteConflictFile(ctx, thisPathNum, thisNamePair.oldName)
+	}
+	if !b.planCapture {
 		renameSkipped.Add(thisNamePair.oldName) // (due to dry-run, not equality)
+	}
+	return nil
+}
+
+// deleteConflictFile deletes oldName on one path, honouring that path's
+// --backup-dir. It is used by conflict resolution and replayed by --apply.
+func (b *bisyncRun) deleteConflictFile(ctx context.Context, pathNum int, oldName string) error {
+	f, p := b.pathNumFs(pathNum)
+	ctx = b.setBackupDir(ctx, pathNum)
+	ci := fs.GetConfig(ctx)
+	var backupDir fs.Fs
+	if ci.BackupDir != "" {
+		var err error
+		if backupDir, err = operations.BackupDir(ctx, f, f, oldName); err != nil {
+			b.critical = true
+			return err
+		}
+	}
+	obj, err := f.NewObject(ctx, oldName)
+	if err != nil {
+		b.critical = true
+		return err
+	}
+	if err = operations.DeleteFileWithBackupDir(ctx, obj, backupDir); err != nil {
+		err = fmt.Errorf("%s delete failed for %s: %w", p, p+oldName, err)
+		b.critical = true
+		return err
 	}
 	return nil
 }
