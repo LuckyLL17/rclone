@@ -19,6 +19,7 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/cache"
+	"github.com/rclone/rclone/fs/capcache"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/fspath"
@@ -132,6 +133,7 @@ func init() {
 	}
 	configPath = makeConfigPath()
 	cacheDir = makeCacheDir() // Has fallback to tempDir, so set that first
+	capcache.CacheDir = GetCacheDir
 	data = newDefaultStorage()
 }
 

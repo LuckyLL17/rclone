@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/capcache"
 	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/lib/cache"
 )
@@ -135,6 +136,11 @@ func GetFn(ctx context.Context, fsString string, create func(ctx context.Context
 				addMapping(canonicalFsString, canonicalName) // note the fsString-canonicalName connection for future lookups
 				addChild(fsString, canonicalName)            // note the file-directory connection for future lookups
 			}
+		}
+	}
+	if f != nil && fs.GetConfig(ctx).CapabilityCache {
+		if _, err := capcache.Get(ctx, f); err != nil {
+			fs.Debugf(f, "Capability cache: probe failed: %v", err)
 		}
 	}
 	return f, getError(fsString, err) // ensure fs.ErrorIsFile is returned when necessary

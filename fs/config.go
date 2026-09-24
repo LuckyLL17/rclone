@@ -500,6 +500,16 @@ var ConfigOptionsInfo = Options{{
 	Help:    "Disable HTTP/2 in the global transport",
 	Groups:  "Networking",
 }, {
+	Name:    "capability_cache",
+	Default: false,
+	Help:    "Cache remote capability profiles (features, hashes, mime types, server-side copy, listing) by configuration fingerprint",
+	Groups:  "Config",
+}, {
+	Name:    "capability_cache_ttl",
+	Default: 5 * time.Minute,
+	Help:    "TTL for cached remote capability profiles (0 to cache until the configuration changes)",
+	Groups:  "Config",
+}, {
 	Name:    "human_readable",
 	Default: false,
 	Help:    "Print numbers in a human-readable format, sizes with suffix Ki|Mi|Gi|Ti|Pi",
@@ -667,6 +677,8 @@ type ConfigInfo struct {
 	FsCacheExpireDuration      Duration          `config:"fs_cache_expire_duration"`
 	FsCacheExpireInterval      Duration          `config:"fs_cache_expire_interval"`
 	DisableHTTP2               bool              `config:"disable_http2"`
+	CapabilityCache            bool              `config:"capability_cache"`
+	CapabilityCacheTTL         Duration          `config:"capability_cache_ttl"`
 	HumanReadable              bool              `config:"human_readable"`
 	KvLockTime                 Duration          `config:"kv_lock_time"` // maximum time to keep key-value database locked by process
 	DisableHTTPKeepAlives      bool              `config:"disable_http_keep_alives"`
