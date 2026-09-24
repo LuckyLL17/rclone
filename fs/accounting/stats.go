@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/lib/terminal"
@@ -68,6 +69,8 @@ type StatsInfo struct {
 	serverSideMoves       int64
 	serverSideMoveBytes   int64
 	maxCompletedTransfers int
+	events                *EventStream // structured per-file transfer events, nil when disabled
+	jobID                 int64        // rc job id captured at group creation, if any
 }
 
 type averageValues struct {
@@ -87,11 +90,19 @@ func NewStats(ctx context.Context) *StatsInfo {
 	s := &StatsInfo{
 		ci:                    ci,
 		checking:              newTransferMap(ci.Checkers, "checking"),
-		transferring:          newTransferMap(ci.Transfers, "transferring"),
+		transferring:         newTransferMap(ci.Transfers, "transferring"),
 		inProgress:            newInProgress(ctx),
 		startTime:             time.Now(),
 		average:               averageValues{},
 		maxCompletedTransfers: MaxCompletedTransfers,
+	}
+	if ci.TransferEvents {
+		s.events = newEventStream(ci.TransferEventsHistory)
+		if cache.JobGetJobID != nil {
+			if jobID, ok := cache.JobGetJobID(ctx); ok {
+				s.jobID = jobID
+			}
+		}
 	}
 	return s
 }
@@ -741,6 +752,9 @@ func (s *StatsInfo) ResetCounters() {
 	s.listed = 0
 	s.startedTransfers = nil
 	s.oldDuration = 0
+	if s.events != nil {
+		s.events.Reset()
+	}
 
 	// Only restart the average loop if it was running. Otherwise
 	// ResetCounters would spawn a goroutine that pins the StatsInfo,

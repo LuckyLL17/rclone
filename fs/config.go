@@ -414,6 +414,21 @@ var ConfigOptionsInfo = Options{{
 	Help:    "Enable session cookiejar",
 	Groups:  "Networking",
 }, {
+	Name:    "transfer_events",
+	Default: false,
+	Help:    "Enable structured per-file transfer event stream (queued/started/progress/retried/completed/skipped/failed), emitted as JSON Lines on the CLI and queryable with the core/transfer-events RC call",
+	Groups:  "Logging",
+}, {
+	Name:    "transfer_events_history",
+	Default: 1000,
+	Help:    "Number of transfer events to keep in memory per stats group for replay (0 disables history, live events only)",
+	Groups:  "Logging",
+}, {
+	Name:    "transfer_events_progress",
+	Default: time.Second,
+	Help:    "Minimum interval between progress events for an in-flight transfer (0 disables progress events)",
+	Groups:  "Logging",
+}, {
 	Name:    "use_mmap",
 	Default: false,
 	Help:    "Use mmap allocator (see docs)",
@@ -680,6 +695,9 @@ type ConfigInfo struct {
 	MaxConnections             int               `config:"max_connections"`
 	NameTransform              []string          `config:"name_transform"`
 	HTTPProxy                  string            `config:"http_proxy"`
+	TransferEvents             bool              `config:"transfer_events"`
+	TransferEventsHistory      int               `config:"transfer_events_history"`
+	TransferEventsProgress     Duration          `config:"transfer_events_progress"`
 }
 
 func init() {
@@ -741,6 +759,11 @@ func (ci *ConfigInfo) Reload(ctx context.Context) error {
 	if ci.DataRateUnit != "bits" && ci.DataRateUnit != "bytes" {
 		Errorf(nil, "Unknown unit %q passed to --stats-unit. Defaulting to bytes.", ci.DataRateUnit)
 		ci.DataRateUnit = "bytes"
+	}
+
+	// Check --transfer-events-history
+	if ci.TransferEventsHistory < 0 {
+		return fmt.Errorf("--transfer-events-history must be >= 0 (0 disables history)")
 	}
 
 	// Check these are all > 0

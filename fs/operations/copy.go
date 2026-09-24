@@ -345,6 +345,7 @@ func (c *copy) copy(ctx context.Context) (newDst fs.Object, err error) {
 		}
 		if retry {
 			fs.Debugf(c.src, "Received error: %v - low level retry %d/%d", err, tries+1, c.maxTries)
+			c.tr.Retried(ctx, err, tries+1)
 			c.tr.Reset(ctx) // skip incomplete accounting - will be overwritten by retry
 			continue
 		}

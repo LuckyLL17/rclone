@@ -297,6 +297,35 @@ func (s *syncCopyMove) aborting() bool {
 	return s.ctx.Err() != nil
 }
 
+// objectHash returns the common hash type and hash of o, best effort
+func (s *syncCopyMove) objectHash(ctx context.Context, o fs.Object) (string, string) {
+	if s.commonHash == hash.None {
+		return "", ""
+	}
+	h, err := o.Hash(ctx, s.commonHash)
+	if err != nil {
+		fs.Debugf(o, "Failed to read hash for transfer event: %v", err)
+		return "", ""
+	}
+	return s.commonHash.String(), h
+}
+
+// setTransferHash records o's hash on a checking transfer so its
+// lifecycle events can carry the hash.
+func (s *syncCopyMove) setTransferHash(ctx context.Context, tr *accounting.Transfer, o fs.Object) {
+	tr.SetHash(s.objectHash(ctx, o))
+}
+
+// queueUpload records a queued event and adds pair to the upload pipe
+func (s *syncCopyMove) queueUpload(ctx context.Context, pair fs.ObjectPair) bool {
+	stats := accounting.Stats(ctx)
+	if stats.Events() != nil {
+		hashType, hashSum := s.objectHash(ctx, pair.Src)
+		stats.QueuedTransferEvent(ctx, pair.Src.Remote(), pair.Src.Size(), s.fsrc, s.fdst, hashType, hashSum)
+	}
+	return s.toBeUploaded.Put(ctx, pair)
+}
+
 // This reads the map and pumps it into the channel passed in, closing
 // the channel at the end
 func (s *syncCopyMove) pumpMapToChan(files map[string]fs.Object, out chan<- fs.Object) {
@@ -378,6 +407,10 @@ func (s *syncCopyMove) pairChecker(in *pipe, out *pipe, fraction int, wg *sync.W
 		src := pair.Src
 		var err error
 		tr := accounting.Stats(s.ctx).NewCheckingTransfer(src, "checking")
+		if accounting.Stats(s.ctx).Events() != nil {
+			s.setTransferHash(s.ctx, tr, src)
+		}
+		skipped := false
 		// Check to see if can store this
 		if src.Storable() {
 			needTransfer := operations.NeedTransfer(s.ctx, pair.Dst, pair.Src)
@@ -435,19 +468,20 @@ func (s *syncCopyMove) pairChecker(in *pipe, out *pipe, fraction int, wg *sync.W
 						} else {
 							// If successful zero out the dst as it is no longer there and copy the file
 							pair.Dst = nil
-							ok = out.Put(s.inCtx, pair)
+							ok = s.queueUpload(s.inCtx, pair)
 							if !ok {
 								return
 							}
 						}
 					} else {
-						ok = out.Put(s.inCtx, pair)
+						ok = s.queueUpload(s.inCtx, pair)
 						if !ok {
 							return
 						}
 					}
 				}
 			} else {
+				skipped = true
 				// If moving need to delete the files we don't need to copy
 				if s.DoMove {
 					// Delete src if no error on copy
@@ -471,6 +505,9 @@ func (s *syncCopyMove) pairChecker(in *pipe, out *pipe, fraction int, wg *sync.W
 				}
 			}
 		}
+		if skipped && err == nil {
+			tr.Skipped(s.ctx)
+		}
 		tr.Done(s.ctx, err)
 	}
 }
@@ -488,7 +525,7 @@ func (s *syncCopyMove) pairRenamer(in *pipe, out *pipe, fraction int, wg *sync.W
 		if !s.tryRename(src) {
 			// pass on if not renamed
 			fs.Debugf(src, "Need to transfer - No matching file found at Destination")
-			ok = out.Put(s.inCtx, pair)
+			ok = s.queueUpload(s.inCtx, pair)
 			if !ok {
 				return
 			}
@@ -1032,6 +1069,10 @@ func (s *syncCopyMove) run() error {
 		fs.Infof(nil, "There was nothing to transfer")
 	}
 
+	// Turn files still queued or in flight because the run was aborted
+	// into failed events, then wake live event subscribers
+	accounting.Stats(s.ctx).EventsFinish(s.ctx, errors.Join(s.ctx.Err(), s.inCtx.Err(), s.currentError()))
+
 	// cancel the contexts to free resources
 	s.inCancel()
 	s.cancel()
@@ -1273,10 +1314,13 @@ func (s *syncCopyMove) SrcOnly(src fs.DirEntry) (recurse bool) {
 				// No need to check since doesn't exist
 				fs.Debugf(src, "Need to transfer - File not found at Destination")
 				s.markDirModifiedObject(x)
-				ok := s.toBeUploaded.Put(s.inCtx, fs.ObjectPair{Src: x, Dst: nil})
+				ok := s.queueUpload(s.inCtx, fs.ObjectPair{Src: x, Dst: nil})
 				if !ok {
 					return
 				}
+			} else if accounting.Stats(s.ctx).Events() != nil {
+				hashType, hashSum := s.objectHash(s.ctx, x)
+				accounting.Stats(s.ctx).SkippedTransferEvent(s.ctx, x.Remote(), x.Size(), s.fsrc, s.fdst, hashType, hashSum)
 			}
 		}
 	case fs.Directory:

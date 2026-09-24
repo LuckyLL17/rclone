@@ -8,6 +8,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -250,6 +251,7 @@ func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
 	} else if showStats {
 		stopStats = StartStats()
 	}
+	stopTransferEvents := startTransferEvents()
 	SigInfoHandler()
 	for try := 1; try <= ci.Retries; try++ {
 		cmdErr = f()
@@ -292,6 +294,7 @@ func Run(Retry bool, showStats bool, cmd *cobra.Command, f func() error) {
 		}
 	}
 	stopStats()
+	stopTransferEvents()
 	if showStats && (accounting.GlobalStats().Errored() || *statsInterval > 0) {
 		accounting.GlobalStats().Log()
 	}
@@ -375,6 +378,41 @@ func StartStats() func() {
 	})
 	return func() {
 		close(stopStats)
+		wg.Wait()
+	}
+}
+
+// startTransferEvents writes the global transfer event stream to
+// stdout as JSON Lines when --transfer-events is enabled.
+//
+// It returns a func which should be called after the command finished.
+func startTransferEvents() func() {
+	ctx := context.Background()
+	ci := fs.GetConfig(ctx)
+	if !ci.TransferEvents {
+		return func() {}
+	}
+	events, done, cancel := accounting.GlobalStats().SubscribeTransferEvents()
+	if events == nil {
+		return func() {}
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		encoder := json.NewEncoder(os.Stdout)
+		for {
+			select {
+			case event, ok := <-events:
+				if !ok {
+					return
+				}
+				_ = encoder.Encode(event)
+			case <-done:
+				return
+			}
+		}
+	})
+	return func() {
+		cancel()
 		wg.Wait()
 	}
 }

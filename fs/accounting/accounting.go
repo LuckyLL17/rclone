@@ -118,8 +118,36 @@ func newAccountSizeName(ctx context.Context, stats *StatsInfo, in io.ReadCloser,
 	}
 
 	go acc.averageLoop()
+	if stats.events != nil && time.Duration(acc.ci.TransferEventsProgress) > 0 {
+		go acc.progressEventLoop()
+	}
 	stats.inProgress.set(acc.name, acc)
 	return acc
+}
+
+// progressEventLoop emits throttled progress events for an in-flight
+// transfer until accounting is done.
+func (acc *Account) progressEventLoop() {
+	interval := time.Duration(acc.ci.TransferEventsProgress)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var lastBytes int64
+	for {
+		select {
+		case <-ticker.C:
+			b, _ := acc.progress()
+			if b == lastBytes {
+				continue
+			}
+			lastBytes = b
+			acc.mu.Lock()
+			ctx := acc.ctx
+			acc.mu.Unlock()
+			acc.stats.progressEvent(ctx, acc.name, acc.size, b)
+		case <-acc.exit:
+			return
+		}
+	}
 }
 
 // WithBuffer - If the file is above a certain size it adds an Async reader

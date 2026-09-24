@@ -53,6 +53,7 @@ type Transfer struct {
 	size      int64
 	startedAt time.Time
 	checking  bool
+	noHistory bool // if set don't emit transfer events for this bookkeeping transfer
 	what      string // what kind of transfer this is
 	srcFs     fs.Fs  // source Fs - may be nil
 	dstFs     fs.Fs  // destination Fs - may be nil
@@ -67,6 +68,8 @@ type Transfer struct {
 	err         error
 	completedAt time.Time
 	doneBytes   int64
+	hashType    string
+	hashSum     string
 }
 
 // newCheckingTransfer instantiates new checking of the object.
@@ -94,6 +97,7 @@ func newTransferRemoteSize(stats *StatsInfo, remote string, size int64, checking
 		size:      size,
 		startedAt: time.Now(),
 		checking:  checking,
+		noHistory: noHistory,
 		what:      what,
 		srcFs:     srcFs,
 		dstFs:     dstFs,
@@ -101,7 +105,70 @@ func newTransferRemoteSize(stats *StatsInfo, remote string, size int64, checking
 	if !noHistory {
 		stats.AddTransfer(tr)
 	}
+	if !checking && stats.events != nil {
+		stats.StartedTransferEvent(remote, size, srcFs, dstFs)
+	}
 	return tr
+}
+
+// SetHash records the hash of the object being processed so that
+// later lifecycle events for the transfer can carry it.
+func (tr *Transfer) SetHash(hashType, hashSum string) {
+	tr.mu.Lock()
+	tr.hashType, tr.hashSum = hashType, hashSum
+	tr.mu.Unlock()
+}
+
+// event builds a lifecycle event for this transfer.
+func (tr *Transfer) event(typ TransferEventType) TransferEvent {
+	tr.mu.RLock()
+	hashType, hashSum, doneBytes := tr.hashType, tr.hashSum, tr.doneBytes
+	tr.mu.RUnlock()
+	return TransferEvent{
+		Type:     typ,
+		Object:   tr.remote,
+		Size:     tr.size,
+		Bytes:    doneBytes,
+		HashType: hashType,
+		Hash:     hashSum,
+		SrcFs:    fsString(tr.srcFs),
+		DstFs:    fsString(tr.dstFs),
+	}
+}
+
+// Skipped emits a skipped event for this (checking) transfer.
+func (tr *Transfer) Skipped(ctx context.Context) {
+	if tr.stats.events == nil || tr.noHistory {
+		return
+	}
+	tr.stats.emitTransferEvent(ctx, tr.event(TransferEventSkipped))
+}
+
+// Retried emits a retried event for this transfer after a failed
+// low level copy attempt.
+func (tr *Transfer) Retried(ctx context.Context, err error, attempt int) {
+	if tr.stats.events == nil {
+		return
+	}
+	e := tr.event(TransferEventRetried)
+	e.Attempt = attempt
+	if err != nil {
+		e.Error = err.Error()
+	}
+	tr.stats.emitTransferEvent(ctx, e)
+}
+
+// emitTerminal emits the terminal completed or failed event.
+func (tr *Transfer) emitTerminal(ctx context.Context, err error) {
+	typ := TransferEventCompleted
+	if err != nil {
+		typ = TransferEventFailed
+	}
+	e := tr.event(typ)
+	if err != nil {
+		e.Error = err.Error()
+	}
+	tr.stats.emitTransferEvent(ctx, e)
 }
 
 // Done ends the transfer.
@@ -149,6 +216,15 @@ func (tr *Transfer) Done(ctx context.Context, err error) {
 		tr.stats.DoneTransferring(tr.remote, err == nil)
 	}
 	tr.stats.PruneTransfers()
+
+	if tr.stats.events != nil {
+		switch {
+		case !tr.checking:
+			tr.emitTerminal(ctx, err)
+		case err != nil && !tr.noHistory:
+			tr.emitTerminal(ctx, err)
+		}
+	}
 }
 
 // Reset allows to switch the Account to another transfer method.
