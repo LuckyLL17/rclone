@@ -16,6 +16,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/flags"
 	"github.com/rclone/rclone/fs/dirtree"
+	"github.com/rclone/rclone/fs/listcursor"
 	"github.com/rclone/rclone/fs/log"
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/lib/encoder"
@@ -28,6 +29,8 @@ var (
 	outFileName string
 	noReport    bool
 	sort        string
+	cursorIn    string
+	cursorOut   string
 	enc         = encoder.OS
 )
 
@@ -42,6 +45,8 @@ func init() {
 	flags.BoolVarP(cmdFlags, &noReport, "noreport", "", false, "Turn off file/directory count at end of tree listing", "")
 	// flags.BoolVarP(cmdFlags, &opts.FollowLink, "follow", "l", false, "Follow symbolic links like directories","")
 	flags.IntVarP(cmdFlags, &opts.DeepLevel, "level", "", 0, "Descend only level directories deep", "")
+	flags.StringVarP(cmdFlags, &cursorIn, "cursor", "", "", "Resume a paged tree listing from this continuation cursor", "")
+	flags.StringVarP(cmdFlags, &cursorOut, "cursor-out", "", "", "Write the next continuation cursor to file instead of logging it", "")
 	// flags.StringVarP(cmdFlags, &opts.Pattern, "pattern", "P", "", "List only those files that match the pattern given")
 	// flags.StringVarP(cmdFlags, &opts.IPattern, "exclude", "", "", "Do not list files that match the given pattern")
 	flags.StringVarP(cmdFlags, &outFileName, "output", "o", "", "Output to file instead of stdout", "")
@@ -127,6 +132,22 @@ For a more interactive navigation of the remote see the
 			opts.DeepLevel = ci.MaxDepth
 		}
 		cmd.Run(false, false, command, func() error {
+			ctx := context.Background()
+			if cursorIn != "" {
+				nextCursor, err := TreePage(ctx, fsrc, outFile, &opts, cursorIn)
+				if err != nil {
+					return err
+				}
+				if nextCursor != "" {
+					if cursorOut != "" {
+						return os.WriteFile(cursorOut, []byte(nextCursor+"\n"), 0o600)
+					}
+					fs.Logf(fsrc, "Next cursor: %s", nextCursor)
+				} else {
+					fs.Logf(fsrc, "Listing complete")
+				}
+				return nil
+			}
 			return Tree(fsrc, outFile, &opts)
 		})
 		return nil
@@ -139,6 +160,34 @@ func Tree(fsrc fs.Fs, outFile io.Writer, opts *tree.Options) error {
 	if err != nil {
 		return err
 	}
+	return renderTree(fsrc, dirs, outFile, opts)
+}
+
+// TreePage lists one resumed page of fsrc: entries at and after the
+// decoded cursor are rendered with their parent directories kept as
+// scaffolding. The returned cursor is empty when the listing is
+// complete.
+func TreePage(ctx context.Context, fsrc fs.Fs, outFile io.Writer, opts *tree.Options, encodedCursor string) (nextCursor string, err error) {
+	cur, err := listcursor.DecodeCursor(encodedCursor)
+	if err != nil {
+		return "", err
+	}
+	dirs, next, err := listcursor.NewDirTreePage(ctx, fsrc, "", false, opts.DeepLevel, cur)
+	if err != nil {
+		return "", err
+	}
+	if err := renderTree(fsrc, dirs, outFile, opts); err != nil {
+		return "", err
+	}
+	if next != nil {
+		return next.Encode()
+	}
+	return "", nil
+}
+
+// renderTree renders a directory tree in the format of the unix tree
+// command and prints the footer report unless disabled.
+func renderTree(fsrc fs.Fs, dirs dirtree.DirTree, outFile io.Writer, opts *tree.Options) error {
 	opts.Fs = NewFs(dirs)
 	opts.OutFile = outFile
 	inf := tree.New("/")

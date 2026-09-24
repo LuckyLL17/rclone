@@ -19,6 +19,7 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/listcursor"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/lib/diskusage"
@@ -44,11 +45,18 @@ func init() {
     - filesOnly - If set only show files
     - metadata - If set return metadata of objects also
     - hashTypes - array of strings of hash types to show if showHash set
+    - cursor - continuation cursor from a previous paged call
+    - pageSize - return at most this many entries per call
 
 Returns:
 
 - list
     - This is an array of objects as described in the lsjson command
+- nextCursor
+    - Present with paged listings which have further pages; pass it
+    back as opt.cursor to fetch the next page.
+- done
+    - True when the paged listing is complete.
 
 See the [lsjson](/commands/rclone_lsjson/) command for more information on the above and examples.
 `,
@@ -67,15 +75,30 @@ func rcList(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 		return nil, err
 	}
 	list := []*ListJSONItem{}
-	err = ListJSON(ctx, f, remote, &opt, func(item *ListJSONItem) error {
-		list = append(list, item)
-		return nil
-	})
+	paged := opt.Cursor != "" || opt.PageSize > 0
+	var nextCursor string
+	if paged {
+		nextCursor, err = ListJSONPage(ctx, f, remote, &opt, func(item *ListJSONItem) error {
+			list = append(list, item)
+			return nil
+		})
+	} else {
+		err = ListJSON(ctx, f, remote, &opt, func(item *ListJSONItem) error {
+			list = append(list, item)
+			return nil
+		})
+	}
 	if err != nil {
 		return nil, err
 	}
 	out = make(rc.Params)
 	out["list"] = list
+	if paged {
+		out["done"] = nextCursor == ""
+		if nextCursor != "" {
+			out["nextCursor"] = nextCursor
+		}
+	}
 	return out, nil
 }
 
@@ -355,11 +378,18 @@ func init() {
 		Help: `This takes the following parameters:
 
 - fs - a remote name string e.g. "drive:path/to/dir"
+- cursor - continuation cursor from a previous paged call (optional)
+- pageSize - count a single page of at most this many objects (optional)
 
 Returns:
 
 - count - number of files
 - bytes - number of bytes in those files
+- sizeless - number of files with unknown size
+- nextCursor - continuation cursor when more pages remain
+- done - true when the paged listing is complete
+
+Without cursor/pageSize this counts the whole listing in one call.
 
 See the [size](/commands/rclone_size/) command for more information on the above.
 `,
@@ -372,14 +402,65 @@ func rcSize(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	if err != nil {
 		return nil, err
 	}
-	count, bytes, sizeless, err := Count(ctx, f)
+	cursorString, err := in.GetString("cursor")
+	if rc.NotErrParamNotFound(err) {
+		return nil, err
+	}
+	pageSize, err := in.GetInt("pageSize")
+	if rc.NotErrParamNotFound(err) {
+		return nil, err
+	}
+	if cursorString == "" && pageSize == 0 {
+		count, bytes, sizeless, err := Count(ctx, f)
+		if err != nil {
+			return nil, err
+		}
+		out = make(rc.Params)
+		out["count"] = count
+		out["bytes"] = bytes
+		out["sizeless"] = sizeless
+		return out, nil
+	}
+	cur, err := listcursor.DecodeCursor(cursorString)
 	if err != nil {
 		return nil, err
+	}
+	ci := fs.GetConfig(ctx)
+	page, next, err := listcursor.ListPage(ctx, f, "", listcursor.Options{
+		MaxLevel: ConfigMaxDepth(ctx, false),
+		ListType: walk.ListObjects,
+		PageSize: pageSize,
+		TTL:      time.Duration(ci.ListCursorTTL),
+	}, cur)
+	if err != nil {
+		return nil, err
+	}
+	var count, bytes, sizeless int64
+	for _, entry := range page {
+		o, ok := entry.(fs.Object)
+		if !ok {
+			continue
+		}
+		count++
+		objectSize := o.Size()
+		if objectSize < 0 {
+			sizeless++
+		} else if objectSize > 0 {
+			bytes += objectSize
+		}
 	}
 	out = make(rc.Params)
 	out["count"] = count
 	out["bytes"] = bytes
 	out["sizeless"] = sizeless
+	out["done"] = next == nil
+	if next != nil {
+		encoded, err := next.Encode()
+		if err != nil {
+			return nil, err
+		}
+		out["nextCursor"] = encoded
+	}
 	return out, nil
 }
 

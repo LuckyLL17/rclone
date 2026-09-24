@@ -14,6 +14,7 @@ import (
 	"github.com/rclone/rclone/fs/dirtree"
 	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/list"
+	"github.com/rclone/rclone/fs/listcursor"
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/lib/transform"
 	"golang.org/x/sync/semaphore"
@@ -45,11 +46,21 @@ type March struct {
 	NoCheckDest            bool            // transfer all objects regardless without checking dst
 	NoUnicodeNormalization bool            // don't normalize unicode characters in filenames
 	NoProcessDstOnly       bool            // if set, when source listing finishes, cancel the dst listing
+	// SrcResumeKey resumes a copy: source objects with Remote()
+	// strictly before this key are treated as already processed and
+	// skipped, together with directory subtrees wholly before it. The
+	// object at the key must exist unchanged, otherwise the run fails
+	// with listcursor.ErrCursorInvalid.
+	SrcResumeKey string
+	// SrcResumeFp is the listcursor boundary fingerprint (type
+	// prefixed fs.Fingerprint) of the SrcResumeKey object.
+	SrcResumeFp string
 	// internal state
-	srcListDir   listDirFn // function to call to list a directory in the src
-	dstListDir   listDirFn // function to call to list a directory in the dst
-	transforms   []matchTransformFn
-	newObjectSem *semaphore.Weighted // make sure we don't call too many NewObjects simultaneously
+	srcListDir     listDirFn // function to call to list a directory in the src
+	dstListDir     listDirFn // function to call to list a directory in the dst
+	srcResumeFound bool      // the SrcResumeKey object was seen
+	transforms     []matchTransformFn
+	newObjectSem   *semaphore.Weighted // make sure we don't call too many NewObjects simultaneously
 }
 
 // Marcher is called on each match
@@ -67,6 +78,9 @@ type Marcher interface {
 func (m *March) init(ctx context.Context) {
 	ci := fs.GetConfig(ctx)
 	m.srcListDir = m.makeListDir(ctx, m.Fsrc, m.SrcIncludeAll, m.srcKey)
+	if m.SrcResumeKey != "" {
+		m.srcListDir = m.makeResumeListDir(m.srcListDir)
+	}
 	if !m.NoTraverse {
 		m.dstListDir = m.makeListDir(ctx, m.Fdst, m.DstIncludeAll, m.dstKey)
 	}
@@ -189,6 +203,57 @@ type listDirJob struct {
 	noDst     bool
 }
 
+// makeResumeListDir wraps a source listing so entries covered by a
+// list cursor boundary are treated as already processed.
+//
+// Objects with Remote before SrcResumeKey are dropped and the object
+// at the key is only used to prove the boundary exists unchanged. A
+// directory subtree is dropped whole when every entry in it sorts
+// before the key; ancestor directories of the key are retained and
+// traversed so later siblings are still listed.
+func (m *March) makeResumeListDir(inner listDirFn) listDirFn {
+	var mu sync.Mutex
+	return func(ctx context.Context, dir string, callback fs.ListRCallback) error {
+		return inner(ctx, dir, func(entries fs.DirEntries) error {
+			mu.Lock()
+			defer mu.Unlock()
+			out := entries[:0]
+			for _, entry := range entries {
+				switch x := entry.(type) {
+				case fs.Directory:
+					dirPrefix := x.Remote() + "/"
+					if dirPrefix < m.SrcResumeKey && !strings.HasPrefix(m.SrcResumeKey, dirPrefix) {
+						continue
+					}
+					if !m.srcResumeFound && dirPrefix > m.SrcResumeKey {
+						return fmt.Errorf("%w: boundary source object %q not found, refusing to resume the copy", listcursor.ErrCursorInvalid, m.SrcResumeKey)
+					}
+					out = append(out, entry)
+				case fs.Object:
+					switch {
+					case x.Remote() < m.SrcResumeKey:
+						continue
+					case x.Remote() == m.SrcResumeKey:
+						if m.SrcResumeFp != "" && "o:"+fs.Fingerprint(ctx, x, true) != m.SrcResumeFp {
+							return fmt.Errorf("%w: boundary source object %q changed since the cursor was made", listcursor.ErrCursorInvalid, x.Remote())
+						}
+						m.srcResumeFound = true
+						// The boundary object was copied on the previous run.
+						continue
+					case !m.srcResumeFound:
+						return fmt.Errorf("%w: boundary source object %q not found, refusing to resume the copy", listcursor.ErrCursorInvalid, m.SrcResumeKey)
+					default:
+						out = append(out, entry)
+					}
+				default:
+					out = append(out, entry)
+				}
+			}
+			return callback(out)
+		})
+	}
+}
+
 // Run starts the matching process off
 func (m *March) Run(ctx context.Context) error {
 	ci := fs.GetConfig(ctx)
@@ -279,6 +344,9 @@ func (m *March) Run(ctx context.Context) error {
 	close(in)
 	wg.Wait()
 
+	if jobError == nil && m.SrcResumeKey != "" && !m.srcResumeFound {
+		jobError = fmt.Errorf("%w: boundary source object %q not found, refusing to resume the copy", listcursor.ErrCursorInvalid, m.SrcResumeKey)
+	}
 	if errCount > 1 {
 		return fmt.Errorf("march failed with %d error(s): first error: %w", errCount, jobError)
 	}

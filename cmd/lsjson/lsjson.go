@@ -33,6 +33,8 @@ func init() {
 	flags.BoolVarP(cmdFlags, &opt.DirsOnly, "dirs-only", "", false, "Show only directories in the listing", "")
 	flags.BoolVarP(cmdFlags, &opt.Metadata, "metadata", "M", false, "Add metadata to the listing", "")
 	flags.StringArrayVarP(cmdFlags, &opt.HashTypes, "hash-type", "", nil, "Show only this hash type (may be repeated)", "")
+	flags.StringVarP(cmdFlags, &opt.Cursor, "cursor", "", "", "Resume a paged listing from this continuation cursor", "")
+	flags.IntVarP(cmdFlags, &opt.PageSize, "page-size", "", 0, "Return at most this many entries and a continuation cursor", "")
 	flags.BoolVarP(cmdFlags, &statOnly, "stat", "", false, "Just return the info for the pointed to file", "")
 }
 
@@ -159,7 +161,7 @@ can be processed line by line as each item is written on individual lines
 			} else {
 				fmt.Println("[")
 				first := true
-				err := operations.ListJSON(context.Background(), fsrc, remote, &opt, func(item *operations.ListJSONItem) error {
+				nextCursor, err := operations.ListJSONPage(context.Background(), fsrc, remote, &opt, func(item *operations.ListJSONItem) error {
 					out, err := json.Marshal(item)
 					if err != nil {
 						return fmt.Errorf("failed to marshal list object: %w", err)
@@ -182,6 +184,9 @@ can be processed line by line as each item is written on individual lines
 					fmt.Println()
 				}
 				fmt.Println("]")
+				if nextCursor != "" {
+					fs.Logf(fsrc, "Next cursor: %s", nextCursor)
+				}
 			}
 			return nil
 		})

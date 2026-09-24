@@ -278,6 +278,21 @@ var ConfigOptionsInfo = Options{{
 	Help:    "Use recursive list if available; uses more memory but fewer transactions",
 	Groups:  "Listing",
 }, {
+	Name:    "list_cursor_in",
+	Default: "",
+	Help:    "Resume a paged directory listing from this continuation cursor",
+	Groups:  "Listing",
+}, {
+	Name:    "list_page_size",
+	Default: 0,
+	Help:    "Number of entries per page for resumable listings (0 = backend default)",
+	Groups:  "Listing",
+}, {
+	Name:    "list_cursor_ttl",
+	Default: 24 * time.Hour,
+	Help:    "Lifetime of a directory listing continuation cursor",
+	Groups:  "Listing",
+}, {
 	Name:    "list_cutoff",
 	Default: 1_000_000,
 	Help:    "To save memory, sort directory listings on disk above this threshold",
@@ -617,6 +632,9 @@ type ConfigInfo struct {
 	Suffix                     string            `config:"suffix"`
 	SuffixKeepExtension        bool              `config:"suffix_keep_extension"`
 	UseListR                   bool              `config:"fast_list"`
+	ListCursorIn               string            `config:"list_cursor_in"`  // continuation cursor to resume a paged directory listing
+	ListPageSize               int               `config:"list_page_size"`  // entries per page for resumable listings
+	ListCursorTTL              Duration          `config:"list_cursor_ttl"` // lifetime of a continuation cursor
 	ListCutoff                 int               `config:"list_cutoff"`
 	BufferSize                 SizeSuffix        `config:"buffer_size"`
 	BwLimit                    BwTimetable       `config:"bwlimit"`

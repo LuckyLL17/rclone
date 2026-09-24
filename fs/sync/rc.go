@@ -25,6 +25,7 @@ func init() {
 - srcFs - a remote name string e.g. "drive:src" for the source
 - dstFs - a remote name string e.g. "drive:dst" for the destination
 - createEmptySrcDirs - create empty src directories on destination if set
+- cursor - resume a copy from this list cursor (copy only, ignored for files) (optional)
 ` + moveHelp + `- combined - make a combined report of changes (default false)
 - missingOnSrc - report all files missing from the source (default false)
 - missingOnDst - report all files missing from the destination (default false)
@@ -65,6 +66,15 @@ func rcSyncCopyMove(ctx context.Context, in rc.Params, name string) (out rc.Para
 	createEmptySrcDirs, err := in.GetBool("createEmptySrcDirs")
 	if rc.NotErrParamNotFound(err) {
 		return nil, err
+	}
+	cursor, err := in.GetString("cursor")
+	if rc.NotErrParamNotFound(err) {
+		return nil, err
+	}
+	if cursor != "" {
+		var ci *fs.ConfigInfo
+		ctx, ci = fs.AddConfig(ctx)
+		ci.ListCursorIn = cursor
 	}
 	ctx, out = rcLogger(ctx, in, dstFs)
 	switch name {

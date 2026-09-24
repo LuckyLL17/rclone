@@ -13,6 +13,7 @@ import (
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/list"
+	"github.com/rclone/rclone/fs/listcursor"
 	"github.com/rclone/rclone/fs/walk"
 )
 
@@ -85,6 +86,8 @@ type ListJSONOpt struct {
 	FilesOnly     bool     `json:"filesOnly"`
 	Metadata      bool     `json:"metadata"`
 	HashTypes     []string `json:"hashTypes"` // hash types to show if ShowHash is set, e.g. "MD5", "SHA-1"
+	Cursor        string   `json:"cursor"`    // resume a paged listing from this continuation cursor
+	PageSize      int      `json:"pageSize"`  // number of entries per page, 0 for a complete listing
 }
 
 // state for ListJson
@@ -242,11 +245,29 @@ func (lj *listJSON) entry(ctx context.Context, entry fs.DirEntry) (*ListJSONItem
 
 // ListJSON lists fsrc using the options in opt calling callback for each item
 func ListJSON(ctx context.Context, fsrc fs.Fs, remote string, opt *ListJSONOpt, callback func(*ListJSONItem) error) error {
-	lj, err := newListJSON(ctx, fsrc, remote, opt)
+	nextCursor, err := ListJSONPage(ctx, fsrc, remote, opt, callback)
 	if err != nil {
 		return err
 	}
-	err = walk.ListR(ctx, fsrc, remote, false, ConfigMaxDepth(ctx, lj.opt.Recurse), walk.ListAll, func(entries fs.DirEntries) (err error) {
+	if nextCursor != "" {
+		return fmt.Errorf("internal error: paged listing returned a cursor without pagination enabled")
+	}
+	return nil
+}
+
+// ListJSONPage lists one page of fsrc using the options in opt,
+// calling callback for each item.
+//
+// Pagination is enabled by opt.Cursor or opt.PageSize; the returned
+// cursor is empty once the listing is complete. When pagination is
+// disabled this behaves exactly like ListJSON and always returns an
+// empty cursor.
+func ListJSONPage(ctx context.Context, fsrc fs.Fs, remote string, opt *ListJSONOpt, callback func(*ListJSONItem) error) (nextCursor string, err error) {
+	lj, err := newListJSON(ctx, fsrc, remote, opt)
+	if err != nil {
+		return "", err
+	}
+	emit := func(entries fs.DirEntries) error {
 		for _, entry := range entries {
 			item, err := lj.entry(ctx, entry)
 			if err != nil {
@@ -260,11 +281,40 @@ func ListJSON(ctx context.Context, fsrc fs.Fs, remote string, opt *ListJSONOpt, 
 			}
 		}
 		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("error in ListJSON: %w", err)
 	}
-	return nil
+	if opt.Cursor == "" && opt.PageSize == 0 {
+		err = walk.ListR(ctx, fsrc, remote, false, ConfigMaxDepth(ctx, lj.opt.Recurse), walk.ListAll, emit)
+		if err != nil {
+			return "", fmt.Errorf("error in ListJSON: %w", err)
+		}
+		return "", nil
+	}
+	cur, err := listcursor.DecodeCursor(opt.Cursor)
+	if err != nil {
+		return "", err
+	}
+	pageOpt := listcursor.Options{
+		IncludeAll: false,
+		MaxLevel:   ConfigMaxDepth(ctx, opt.Recurse),
+		ListType:   walk.ListAll,
+		PageSize:   opt.PageSize,
+		TTL:        time.Duration(fs.GetConfig(ctx).ListCursorTTL),
+	}
+	page, next, err := listcursor.ListPage(ctx, fsrc, remote, pageOpt, cur)
+	if err != nil {
+		return "", fmt.Errorf("error in ListJSON: %w", err)
+	}
+	if err := emit(page); err != nil {
+		return "", err
+	}
+	if next != nil {
+		encoded, err := next.Encode()
+		if err != nil {
+			return "", err
+		}
+		return encoded, nil
+	}
+	return "", nil
 }
 
 // StatJSON returns a single JSON stat entry for the fsrc, remote path

@@ -174,6 +174,27 @@ type Features struct {
 	// immediately.
 	ListP func(ctx context.Context, dir string, callback ListRCallback) error
 
+	// ListRCursor lists a single page of the objects and
+	// directories of the Fs starting from dir recursively.
+	//
+	// This is the resumable equivalent of ListR: token is an
+	// opaque backend continuation token. Passing "" as token
+	// starts the listing at the beginning; subsequent calls pass
+	// back the newToken returned by the previous call. Entries
+	// must be delivered in a stable order (lexicographical by
+	// Remote) and each page must contain only entries strictly
+	// after token - callers must never receive the same entry
+	// twice across pages.
+	//
+	// When more is false the final page has been delivered. The
+	// desired page size, if any, is read from GetListRResume(ctx).
+	//
+	// dir should be "" to start from the root, and should not
+	// have trailing slashes. It should return
+	// ErrDirNotFound if the directory isn't found, and stop and
+	// return the callback error if the callback returns one.
+	ListRCursor func(ctx context.Context, dir, token string, callback ListRCallback) (newToken string, more bool, err error)
+
 	// About gets quota information from the Fs
 	About func(ctx context.Context) (*Usage, error)
 
@@ -345,6 +366,9 @@ func (ft *Features) Fill(ctx context.Context, f Fs) *Features {
 	if do, ok := f.(ListPer); ok {
 		ft.ListP = do.ListP
 	}
+	if do, ok := f.(ListRCursorer); ok {
+		ft.ListRCursor = do.ListRCursor
+	}
 	if do, ok := f.(Abouter); ok {
 		ft.About = do.About
 	}
@@ -455,6 +479,9 @@ func (ft *Features) Mask(ctx context.Context, f Fs) *Features {
 	}
 	if mask.ListP == nil {
 		ft.ListP = nil
+	}
+	if mask.ListRCursor == nil {
+		ft.ListRCursor = nil
 	}
 	if mask.About == nil {
 		ft.About = nil
@@ -700,6 +727,34 @@ type ListPer interface {
 	// callback returns an error then the listing will stop
 	// immediately.
 	ListP(ctx context.Context, dir string, callback ListRCallback) error
+}
+
+// ListRCursorer is an optional interface for Fs
+type ListRCursorer interface {
+	// ListRCursor lists a single page of the objects and
+	// directories of the Fs starting from dir recursively.
+	//
+	// It is the resumable equivalent of ListR: token is an
+	// opaque backend continuation token. Passing "" starts the
+	// listing at the beginning; the returned newToken is passed
+	// to the next call to continue. Each page contains only
+	// entries which sort strictly after token, in stable
+	// lexicographical order by Remote, so callers never receive
+	// an entry twice. more is false on the final page.
+	//
+	// The desired page size, if any, is read from
+	// GetListRResume(ctx); a backend which can't honour it may
+	// return a smaller or larger natural page instead.
+	//
+	// dir should be "" to start from the root, and should not
+	// have trailing slashes.
+	//
+	// This should return ErrDirNotFound if the directory isn't
+	// found.
+	//
+	// It should call callback for the page read and stop if
+	// callback returns an error.
+	ListRCursor(ctx context.Context, dir, token string, callback ListRCallback) (newToken string, more bool, err error)
 }
 
 // RangeSeeker is the interface that wraps the RangeSeek method.

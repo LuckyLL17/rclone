@@ -17,6 +17,7 @@ import (
 	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/listcursor"
 	"github.com/rclone/rclone/fs/march"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/lib/errcount"
@@ -41,6 +42,9 @@ type syncCopyMove struct {
 	copyEmptySrcDirs   bool
 	deleteEmptySrcDirs bool
 	dir                string
+	// source listing resume from a list cursor (copy only)
+	srcResumeKey string
+	srcResumeFp  string
 	// internal state
 	ci                     *fs.ConfigInfo         // global config
 	fi                     *filter.Filter         // filter config
@@ -938,6 +942,35 @@ func (s *syncCopyMove) run() error {
 		return nil
 	}
 
+	if s.ci.ListCursorIn != "" {
+		// Resuming a listing is only safe for additive runs: a
+		// resumed sync could delete destination entries whose source
+		// entries were skipped by the cursor boundary.
+		if s.deleteMode != fs.DeleteModeOff || s.DoMove {
+			return fserrors.FatalError(fmt.Errorf("%w: cursor resume is only supported for copy (it must not delete or move destination files); rerun without the cursor for a full sync", listcursor.ErrCursorInvalid))
+		}
+		cur, err := listcursor.DecodeCursor(s.ci.ListCursorIn)
+		if err != nil {
+			return err
+		}
+		err = cur.Validate(s.ctx, s.fsrc, s.dir, listcursor.Options{
+			IncludeAll: false,
+			MaxLevel:   s.ci.MaxDepth,
+			TTL:        time.Duration(s.ci.ListCursorTTL),
+		})
+		if err != nil {
+			return err
+		}
+		if cur.Token != "" {
+			// march rebuilds the source listing, so only the path
+			// boundary can drive it, not a backend token.
+			return fmt.Errorf("%w: native continuation cursor cannot resume a copy", listcursor.ErrCursorInvalid)
+		}
+		s.srcResumeKey = cur.LastKey
+		s.srcResumeFp = cur.LastFp
+		fs.Infof(s.fsrc, "Resuming copy after source boundary %q", s.srcResumeKey)
+	}
+
 	// Start background checking and transferring pipeline
 	s.startCheckers()
 	s.startRenamers()
@@ -961,6 +994,8 @@ func (s *syncCopyMove) run() error {
 		NoCheckDest:            s.noCheckDest,
 		NoUnicodeNormalization: s.noUnicodeNormalization,
 		NoProcessDstOnly:       s.deleteMode == fs.DeleteModeOff && !s.usingLogger,
+		SrcResumeKey:           s.srcResumeKey,
+		SrcResumeFp:            s.srcResumeFp,
 	}
 	s.processError(m.Run(s.ctx))
 
@@ -1418,6 +1453,13 @@ func MoveDir(ctx context.Context, fdst, fsrc fs.Fs, deleteEmptySrcDirs bool, cop
 	if operations.Same(fdst, fsrc) {
 		fs.Errorf(fdst, "Nothing to do as source and destination are the same")
 		return nil
+	}
+
+	// A list cursor can't drive a move: it skips source entries, and
+	// a move deletes them from the source afterwards. Refuse before
+	// any server-side shortcut can move the whole tree.
+	if fs.GetConfig(ctx).ListCursorIn != "" {
+		return fserrors.FatalError(fmt.Errorf("%w: cursor resume is only supported for copy (it must not delete or move files); rerun without the cursor for a full move", listcursor.ErrCursorInvalid))
 	}
 
 	// First attempt to use DirMover if exists, same Fs and no filters are active

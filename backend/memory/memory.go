@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -479,6 +480,63 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 	return list.Flush()
 }
 
+// ListRCursor lists one page of the objects and directories of the
+// Fs starting from dir recursively, continuing after token.
+//
+// Entries are sorted by remote and each page contains only entries
+// strictly after token; newToken holds the remote of the last entry
+// delivered and more reports whether further pages remain.
+func (f *Fs) ListRCursor(ctx context.Context, dir, token string, callback fs.ListRCallback) (newToken string, more bool, err error) {
+	pageSize := 100
+	if resume := fs.GetListRResume(ctx); resume != nil && resume.PageSize > 0 {
+		pageSize = resume.PageSize
+	}
+	entries := fs.DirEntries{}
+	add := func(remote string, entry fs.DirEntry, isDirectory bool) error {
+		if remote > token {
+			entries = append(entries, entry)
+		}
+		return nil
+	}
+	bucket, directory := f.split(dir)
+	if bucket == "" {
+		if directory != "" {
+			return "", false, fs.ErrorListBucketRequired
+		}
+		bucketEntries, err := f.listBuckets(ctx)
+		if err != nil {
+			return "", false, err
+		}
+		for _, bucketEntry := range bucketEntries {
+			if bucketEntry.Remote() > token {
+				entries = append(entries, bucketEntry)
+			}
+			bucketName := bucketEntry.Remote()
+			err = f.list(ctx, bucketName, "", f.rootDirectory, true, true, add)
+			if err != nil {
+				return "", false, err
+			}
+		}
+	} else {
+		err = f.list(ctx, bucket, directory, f.rootDirectory, f.rootBucket == "", true, add)
+		if err != nil {
+			return "", false, err
+		}
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		return entries[i].Remote() < entries[j].Remote()
+	})
+	if len(entries) > pageSize {
+		more = true
+		entries = entries[:pageSize]
+	}
+	if len(entries) > 0 {
+		newToken = entries[len(entries)-1].Remote()
+		err = callback(entries)
+	}
+	return newToken, more, err
+}
+
 // Put the object into the bucket
 //
 // Copy the reader in to the new object which is returned.
@@ -692,11 +750,12 @@ func (o *Object) MimeType(ctx context.Context) string {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs          = &Fs{}
-	_ fs.Copier      = &Fs{}
-	_ fs.PutStreamer = &Fs{}
-	_ fs.ListRer     = &Fs{}
-	_ fs.ListPer     = &Fs{}
-	_ fs.Object      = &Object{}
-	_ fs.MimeTyper   = &Object{}
+	_ fs.Fs            = &Fs{}
+	_ fs.Copier        = &Fs{}
+	_ fs.PutStreamer   = &Fs{}
+	_ fs.ListRer       = &Fs{}
+	_ fs.ListPer       = &Fs{}
+	_ fs.ListRCursorer = &Fs{}
+	_ fs.Object        = &Object{}
+	_ fs.MimeTyper     = &Object{}
 )

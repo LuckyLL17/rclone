@@ -260,6 +260,66 @@ func TestRcList(t *testing.T) {
 	checkFile2(list[2])
 }
 
+// operations/list with cursor/pageSize pages through the listing.
+func TestRcListPaged(t *testing.T) {
+	r, call := rcNewRun(t, "operations/list")
+
+	r.WriteObject(context.Background(), "a", "a", t1)
+	r.WriteObject(context.Background(), "subdir/b", "bb", t2)
+
+	var (
+		paths     []string
+		cursor    string
+		pages     int
+		lastItems []*operations.ListJSONItem
+	)
+	for {
+		in := rc.Params{
+			"fs":     r.FremoteName,
+			"remote": "",
+			"opt": rc.Params{
+				"recurse":  true,
+				"pageSize": 1,
+				"cursor":   cursor,
+			},
+		}
+		out, err := call.Fn(context.Background(), in)
+		require.NoError(t, err)
+		items := out["list"].([]*operations.ListJSONItem)
+		lastItems = items
+		for _, item := range items {
+			paths = append(paths, item.Path)
+		}
+		pages++
+		if out["done"] == true {
+			assert.Empty(t, out["nextCursor"])
+			break
+		}
+		next, ok := out["nextCursor"].(string)
+		require.True(t, ok)
+		require.NotEmpty(t, next)
+		cursor = next
+		require.Less(t, pages, 10, "paging did not terminate")
+	}
+	// Three data pages; a page filled exactly at the end confirms
+	// completion with one final empty page.
+	assert.Equal(t, 4, pages)
+	assert.Empty(t, lastItems)
+	assert.Equal(t, []string{"a", "subdir", "subdir/b"}, paths)
+
+	// A malformed cursor must fail loudly, never restart silently.
+	in := rc.Params{
+		"fs":     r.FremoteName,
+		"remote": "",
+		"opt": rc.Params{
+			"recurse": true,
+			"cursor":  "not-a-cursor",
+		},
+	}
+	_, err := call.Fn(context.Background(), in)
+	require.Error(t, err)
+}
+
 // operations/stat: Stat the given remote and path in JSON format.
 func TestRcStat(t *testing.T) {
 	r, call := rcNewRun(t, "operations/stat")

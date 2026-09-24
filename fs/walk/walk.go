@@ -296,7 +296,7 @@ func listR(ctx context.Context, f fs.Fs, path string, includeAll bool, listType 
 		dm = newDirMap(path)
 	}
 	var mu sync.Mutex
-	err := doListR(ctx, path, func(entries fs.DirEntries) (err error) {
+	callback := func(entries fs.DirEntries) (err error) {
 		accounting.Stats(ctx).Listed(int64(len(entries)))
 		if synthesizeDirs {
 			err = dm.addEntries(entries)
@@ -330,7 +330,18 @@ func listR(ctx context.Context, f fs.Fs, path string, includeAll bool, listType 
 		mu.Lock()
 		defer mu.Unlock()
 		return fn(entries)
-	})
+	}
+	var err error
+	if resume := fs.GetListRResume(ctx); resume != nil && f.Features().ListRCursor != nil {
+		// Single resumable page driven by the backend continuation token
+		var newToken string
+		var more bool
+		newToken, more, err = f.Features().ListRCursor(ctx, path, resume.Token, callback)
+		resume.Token = newToken
+		resume.More = more
+	} else {
+		err = doListR(ctx, path, callback)
+	}
 	if err != nil {
 		return err
 	}
