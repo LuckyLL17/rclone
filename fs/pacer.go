@@ -19,18 +19,30 @@ type logCalculator struct {
 	pacer.Calculator
 }
 
+// NewPacerGate, if non-nil, attaches a pacer.Gate returned for ctx to
+// every Pacer created by NewPacer. It is the extension point used by
+// the remote health circuit breaker; a nil result leaves the Pacer
+// ungated. The default nil hook changes no behaviour.
+var NewPacerGate func(ctx context.Context) pacer.Gate
+
 // NewPacer creates a Pacer for the given Fs and Calculator.
 func NewPacer(ctx context.Context, c pacer.Calculator) *Pacer {
 	ci := GetConfig(ctx)
 	retries := max(ci.LowLevelRetries, 1)
 	maxConnections := max(ci.MaxConnections, 0)
+	options := []pacer.Option{
+		pacer.InvokerOption(pacerInvoker),
+		pacer.MaxConnectionsOption(maxConnections),
+		pacer.RetriesOption(retries),
+		pacer.CalculatorOption(c),
+	}
+	if NewPacerGate != nil {
+		if gate := NewPacerGate(ctx); gate != nil {
+			options = append(options, pacer.GateOption(gate))
+		}
+	}
 	p := &Pacer{
-		Pacer: pacer.New(
-			pacer.InvokerOption(pacerInvoker),
-			pacer.MaxConnectionsOption(maxConnections),
-			pacer.RetriesOption(retries),
-			pacer.CalculatorOption(c),
-		),
+		Pacer: pacer.New(options...),
 	}
 	p.SetCalculator(c)
 	return p

@@ -40,6 +40,32 @@ type pacerOptions struct {
 	retries        int         // Max number of retries
 	calculator     Calculator  // switchable pacing algorithm - call with mu held
 	invoker        InvokerFunc // wrapper function used to invoke the target function
+	gate           Gate        // optional gate consulted before each attempt
+}
+
+// Permit identifies a call allowed by a Gate. Gate implementations
+// choose its concrete type and pacers pass it back to After unchanged.
+type Permit any
+
+// Gate decides whether a paced call may proceed.
+//
+// Before is consulted before every attempt. If it returns an error the
+// attempt, together with any remaining retries, is skipped and the
+// error is returned to the caller without taking the pacing or
+// connection tokens. The returned Permit identifies the allowed call
+// and is handed back to After.
+//
+// After is called once per attempted call with its permit and the
+// invoker result; it is never called for an attempt Before rejected.
+//
+// Calls nested inside another paced call (a paced function pacing a
+// sub-call) skip the gate: the outermost call's Before/After brackets
+// the whole operation.
+//
+// Implementations must be safe for concurrent use.
+type Gate interface {
+	Before() (Permit, error)
+	After(permit Permit, retry bool, err error)
 }
 
 // InvokerFunc is the signature of the wrapper function used to invoke the
@@ -67,6 +93,11 @@ func MaxConnectionsOption(maxConnections int) Option {
 // InvokerOption sets an InvokerFunc for the new Pacer.
 func InvokerOption(invoker InvokerFunc) Option {
 	return func(p *pacerOptions) { p.invoker = invoker }
+}
+
+// GateOption sets a Gate for the new Pacer.
+func GateOption(gate Gate) Option {
+	return func(p *pacerOptions) { p.gate = gate }
 }
 
 // Paced is a function which is called by the Call and CallNoRetry
@@ -219,14 +250,30 @@ func (p *Pacer) endCall(retry bool, err error, limitConnections bool) {
 // problem.
 func (p *Pacer) call(fn Paced, retries int) (err error) {
 	var retry bool
-	limitConnections := false
-	if p.maxConnections > 0 && !caller.Present("(*Pacer).call") {
-		limitConnections = true
+	// Stack walking is only worthwhile when connections are limited or
+	// a gate is attached; with neither enabled behaviour is unchanged.
+	nested := false
+	if p.maxConnections > 0 || p.gate != nil {
+		nested = caller.Present("(*Pacer).call")
 	}
+	limitConnections := p.maxConnections > 0 && !nested
+	// A nested call is part of the outer attempt, so it rides on the
+	// outer permit instead of consulting the gate again - otherwise a
+	// half-open probe's internal calls would reject themselves.
+	gated := p.gate != nil && !nested
 	for i := 1; i <= retries; i++ {
+		var permit Permit
+		if gated {
+			if permit, err = p.gate.Before(); err != nil {
+				return err
+			}
+		}
 		p.beginCall(limitConnections)
 		retry, err = p.invoker(i, retries, fn)
 		p.endCall(retry, err, limitConnections)
+		if gated {
+			p.gate.After(permit, retry, err)
+		}
 		if !retry {
 			break
 		}

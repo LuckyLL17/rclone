@@ -177,6 +177,35 @@ var ConfigOptionsInfo = Options{{
 	Help:    "Number of low level retries to do",
 	Groups:  "Config",
 }, {
+	Name:    "health_enable",
+	Default: false,
+	Help: `Enable the per-remote health circuit breaker.
+
+When enabled a remote that fails --health-failures consecutive
+operations with retriable errors (timeouts, 429 rate limits, 5xx
+server errors) is "opened" for --health-cooldown: new operations
+fail immediately without contacting the remote. Once the cooldown
+elapses a single probe operation is allowed; --health-probe-success
+consecutive successful probes close the circuit. Authentication,
+path and permission failures (e.g. 401, 403, 404) never open the
+circuit. See core/health/status and core/health/reset in the rc.`,
+	Groups: "Health",
+}, {
+	Name:    "health_failures",
+	Default: 5,
+	Help:    "Number of consecutive retriable failures which opens the health circuit breaker",
+	Groups:  "Health",
+}, {
+	Name:    "health_cooldown",
+	Default: 30 * time.Second,
+	Help:    "How long a remote stays cut off before a probe operation is allowed, e.g. 30s, 5m",
+	Groups:  "Health",
+}, {
+	Name:    "health_probe_success",
+	Default: 1,
+	Help:    "Consecutive successful probe operations required to close the health circuit breaker",
+	Groups:  "Health",
+}, {
 	Name:     "update",
 	ShortOpt: "u",
 	Default:  false,
@@ -680,6 +709,10 @@ type ConfigInfo struct {
 	MaxConnections             int               `config:"max_connections"`
 	NameTransform              []string          `config:"name_transform"`
 	HTTPProxy                  string            `config:"http_proxy"`
+	HealthEnable               bool              `config:"health_enable"`
+	HealthFailures             int               `config:"health_failures"`
+	HealthCooldown             Duration          `config:"health_cooldown"`
+	HealthProbeSuccess         int               `config:"health_probe_success"`
 }
 
 func init() {
@@ -748,6 +781,17 @@ func (ci *ConfigInfo) Reload(ctx context.Context) error {
 	nonZero(&ci.LowLevelRetries)
 	nonZero(&ci.Transfers)
 	nonZero(&ci.Checkers)
+
+	// Check the remote health circuit breaker options
+	if ci.HealthFailures < 1 {
+		return fmt.Errorf("--health-failures must be at least 1")
+	}
+	if ci.HealthProbeSuccess < 1 {
+		return fmt.Errorf("--health-probe-success must be at least 1")
+	}
+	if ci.HealthCooldown < 0 {
+		return fmt.Errorf("--health-cooldown must not be negative")
+	}
 
 	return LogReload(ci)
 }

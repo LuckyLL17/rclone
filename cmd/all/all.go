@@ -80,4 +80,8 @@ import (
 	_ "github.com/rclone/rclone/cmd/touch"
 	_ "github.com/rclone/rclone/cmd/tree"
 	_ "github.com/rclone/rclone/cmd/version"
+
+	// Remote health circuit breaker (registers the pacer gate and
+	// the core/health rc endpoints)
+	_ "github.com/rclone/rclone/fs/health"
 )

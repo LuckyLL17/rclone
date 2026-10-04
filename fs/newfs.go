@@ -41,6 +41,32 @@ func IsRCRequest(ctx context.Context) bool {
 	return v
 }
 
+// remoteName carries the config name and root of the backend under
+// construction through the context given to its NewFs.
+type remoteName struct {
+	name string
+	root string
+}
+
+type remoteNameKeyType struct{}
+
+var remoteNameKey = remoteNameKeyType{}
+
+// WithRemoteName returns ctx carrying the config name and root of a
+// backend being constructed.
+func WithRemoteName(ctx context.Context, name, root string) context.Context {
+	return context.WithValue(ctx, remoteNameKey, remoteName{name: name, root: root})
+}
+
+// RemoteName returns the config name and root carried in ctx, if any.
+func RemoteName(ctx context.Context) (name, root string, ok bool) {
+	r, ok := ctx.Value(remoteNameKey).(remoteName)
+	if !ok {
+		return "", "", false
+	}
+	return r.name, r.root, true
+}
+
 // NewFs makes a new Fs object from the path
 //
 // The path is of the form remote:path
@@ -88,6 +114,10 @@ func NewFs(ctx context.Context, path string) (Fs, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Carry the backend's config name and root into construction so
+	// cross-cutting per-remote facilities (e.g. the health circuit
+	// breaker) created by the backend can identify their remote.
+	ctx = WithRemoteName(ctx, configName, fsPath)
 	f, err := fsInfo.NewFs(ctx, configName, fsPath, config)
 	if f != nil && (err == nil || err == ErrorIsFile) {
 		addReverse(f, fsInfo)

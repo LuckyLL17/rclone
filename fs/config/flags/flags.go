@@ -116,6 +116,7 @@ func init() {
 	All.NewGroup("Check", "Flags used for check commands")
 	All.NewGroup("Networking", "Flags for general networking and HTTP stuff")
 	All.NewGroup("Performance", "Flags helpful for increasing performance")
+	All.NewGroup("Health", "Flags for the per-remote health circuit breaker")
 	All.NewGroup("Config", "Flags for general configuration of rclone")
 	All.NewGroup("Debugging", "Flags for developers")
 	All.NewGroup("Filter", "Flags for filtering directory listings")
